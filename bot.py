@@ -33,12 +33,13 @@ YDL_OPTS = {
     "no_warnings": True,
     "default_search": "auto",
     "source_address": "0.0.0.0",
-    # ใช้ client แบบ web เพียวๆ (มี cookies ช่วยยืนยันตัวตนแล้ว) การผสมหลาย
-    # client พร้อมกัน (web+android) บางทีทำให้ format list ปนกันจน selector
-    # หาไฟล์ที่ตรงเงื่อนไขไม่เจอ
+    # ใช้ client แบบ mweb (mobile web) เพราะตอนนี้ YouTube เริ่มบังคับใช้ระบบ
+    # สตรีมแบบ SABR ซึ่งทำให้ client web/tv/ios คืนลิงก์เสียงตรงๆ ไม่ได้อีก
+    # (นี่คือปัญหาฝั่ง YouTube vs yt-dlp ที่กำลังแก้กันอยู่ ไม่ใช่บั๊กโค้ดเรา)
+    # mweb ยังใช้งานได้ดีกว่า client อื่นๆ ในตอนนี้
     "extractor_args": {
         "youtube": {
-            "player_client": ["web"],
+            "player_client": ["mweb"],
         }
     },
 }
