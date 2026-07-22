@@ -3,6 +3,7 @@ import time
 import asyncio
 import threading
 import functools
+import subprocess
 from datetime import datetime, timezone
 
 import discord
@@ -353,17 +354,36 @@ async def _extract_audio(query: str) -> dict:
                 "webpage_url": data.get("webpage_url", query),
                 "stream_url": data.get("url"),
                 "is_live": bool(data.get("is_live")),
+                # บาง CDN (เช่น SoundCloud) เช็ค header พวกนี้ก่อนให้สตรีมเสียงจริง
+                # ถ้าไม่ส่งไปด้วย ffmpeg อาจโดนปฏิเสธเงียบๆ (ไม่มี error แต่ไม่มีเสียง)
+                "http_headers": data.get("http_headers") or {},
             }
 
     return await loop.run_in_executor(None, _run)
 
 
+def _build_ffmpeg_before_options(http_headers: dict) -> str:
+    """ต่อ -headers เข้ากับ FFMPEG_BEFORE_OPTS ถ้ามี http_headers จาก yt-dlp
+    (จำเป็นสำหรับบาง CDN เช่น SoundCloud ที่เช็ค User-Agent/Referer ก่อนให้สตรีม)"""
+    opts = FFMPEG_BEFORE_OPTS
+    if http_headers:
+        header_lines = "".join(f"{k}: {v}\r\n" for k, v in http_headers.items())
+        # ffmpeg รับ -headers เป็น string เดียว ต้อง escape " ให้ถูกก่อนส่งเป็น arg
+        escaped = header_lines.replace('"', '\\"')
+        opts = f'{opts} -headers "{escaped}"'
+    return opts
+
+
 def _play_source(guild, vc, info, original_query):
+    before_opts = _build_ffmpeg_before_options(info.get("http_headers") or {})
     source = discord.FFmpegPCMAudio(
         info["stream_url"],
         executable=FFMPEG_PATH,
-        before_options=FFMPEG_BEFORE_OPTS,
+        before_options=before_opts,
         options=FFMPEG_OPTS,
+        # เอา stderr ของ ffmpeg มาโชว์ใน log ด้วย เผื่อเงียบไม่มีเสียงแบบไม่มี error
+        # อีก จะได้เห็นสาเหตุจริงใน Render logs
+        stderr=subprocess.PIPE,
     )
 
     existing = state["now_playing"].get(guild.id)
@@ -379,6 +399,14 @@ def _play_source(guild, vc, info, original_query):
     def _after(error):
         if error:
             print(f"[{guild.name}] เล่นเพลงเจอ error: {error}")
+        # โชว์ stderr ของ ffmpeg ท้ายๆ ไว้ debug เผื่อเงียบไม่มีเสียงแบบไม่มี error
+        try:
+            if source._process and source._process.stderr:
+                tail = source._process.stderr.read()
+                if tail:
+                    print(f"[{guild.name}] ffmpeg stderr (tail): {tail.decode(errors='ignore')[-1500:]}")
+        except Exception:
+            pass
         fut = asyncio.run_coroutine_threadsafe(_on_track_end(guild, vc, original_query), bot.loop)
         try:
             fut.result()
