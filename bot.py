@@ -28,10 +28,13 @@ YDL_OPTS = {
     # ไปเอาไฟล์ที่ดีที่สุดที่มี (มีวิดีโอติดมาด้วยก็ไม่เป็นไร เพราะฝั่ง ffmpeg
     # ใช้ -vn ตัดภาพทิ้งอยู่แล้ว)
     "format": "bestaudio*/bestaudio/best",
-    "noplaylist": True,
+    "noplaylist": False,
     "quiet": True,
     "no_warnings": True,
-    "default_search": "auto",
+    # ค้นหาเริ่มต้นจาก SoundCloud แทน YouTube (scsearch) เพราะ YouTube เจอปัญหา
+    # SABR streaming บ่อยจนเล่นไม่ได้เรื่อยๆ ส่วน Spotify นั้น yt-dlp ดึงเสียง
+    # จริงไม่ได้เลยเพราะมี DRM ป้องกันแน่นหนา -> ใช้ SoundCloud เป็นค่าเริ่มต้น
+    "default_search": "scsearch",
     "source_address": "0.0.0.0",
     # ใช้หลาย client รวมกัน (yt-dlp จะลองทุกตัวแล้วรวม format ที่หาได้เข้าด้วยกัน)
     # และสั่ง formats=missing_pot เพื่อบังคับเอา format ที่ปกติจะถูกข้ามไป
@@ -89,6 +92,8 @@ state = {
     "start_time": time.time(),
     "sessions": {},      # guild_id -> {guild_name, channel_name, channel_id, join_time, status}
     "now_playing": {},   # guild_id -> {title, url, loop, source_url}
+    "queue": {},         # guild_id -> list of queries (urls) รอเล่นถัดไป
+    "stop_flag": {},      # guild_id -> True ถ้าเพิ่งสั่ง s.stop มา (กันไม่ให้เล่นคิวถัดไปอัตโนมัติ)
 }
 
 RECONNECT_MAX_RETRY = 5
@@ -134,6 +139,8 @@ async def leave_cmd(ctx):
     await vc.disconnect(force=True)
     _clear_session(ctx.guild.id)
     state["now_playing"].pop(ctx.guild.id, None)
+    state["queue"].pop(ctx.guild.id, None)
+    state["stop_flag"].pop(ctx.guild.id, None)
     await ctx.reply("ออกจากห้องเสียงแล้ว 👋")
 
 
@@ -154,9 +161,10 @@ async def status_cmd(ctx):
 
 @bot.command(name="play")
 async def play_cmd(ctx, *, query: str = None):
-    """s.play <ลิงก์ยูทูป หรือ คำค้นหา> -> เล่นเสียงในห้องเสียง (รองรับคลิปยาว/ไลฟ์สด)"""
+    """s.play <ลิงก์/คำค้นหา> -> เล่นเสียง รองรับ SoundCloud/Mixcloud/Bandcamp ฯลฯ
+    ถ้าเป็นลิงก์เพลย์ลิสต์ จะเพิ่มเข้าคิวเล่นต่อกันอัตโนมัติทั้งหมด"""
     if not query:
-        await ctx.reply("ใส่ลิงก์หรือคำค้นหาด้วยครับ เช่น `s.play https://youtu.be/xxxx`")
+        await ctx.reply("ใส่ลิงก์หรือคำค้นหาด้วยครับ เช่น `s.play <ลิงก์ SoundCloud>` หรือ `s.play ชื่อเพลง`")
         return
 
     # เข้าห้องเสียงก่อนถ้ายังไม่เข้า
@@ -169,17 +177,93 @@ async def play_cmd(ctx, *, query: str = None):
         vc = await channel.connect(reconnect=True, self_deaf=True)
         _record_join(ctx.guild, channel)
 
-    await ctx.reply(f"🔎 กำลังค้นหา/ดึงสตรีมเสียง: `{query}` ...")
+    await ctx.reply(f"🔎 กำลังค้นหา/ดึงข้อมูล: `{query}` ...")
+
+    guild_id = ctx.guild.id
 
     try:
-        info = await _extract_audio(query)
+        urls = await _resolve_urls(query)
+    except Exception as e:
+        await ctx.reply(f"ดึงข้อมูลไม่สำเร็จครับ: {e}")
+        return
+
+    if not urls:
+        await ctx.reply("ไม่พบเพลงจากคำค้นหา/ลิงก์นี้ครับ")
+        return
+
+    is_currently_playing = vc.is_playing() or vc.is_paused()
+
+    if is_currently_playing:
+        # มีเพลงเล่นอยู่แล้ว -> ต่อคิวไว้ทั้งหมด
+        state["queue"].setdefault(guild_id, [])
+        state["queue"][guild_id].extend(urls)
+        if len(urls) == 1:
+            await ctx.reply(f"➕ เพิ่มเข้าคิวแล้ว (อยู่ลำดับที่ {len(state['queue'][guild_id])})")
+        else:
+            await ctx.reply(f"📃 เพิ่มเพลย์ลิสต์เข้าคิวแล้ว {len(urls)} เพลง (คิวรวมตอนนี้ {len(state['queue'][guild_id])} เพลง)")
+        return
+
+    # ยังไม่มีอะไรเล่นอยู่ -> เล่นเพลงแรกทันที เก็บที่เหลือไว้ในคิว
+    first_url, rest_urls = urls[0], urls[1:]
+    if rest_urls:
+        state["queue"][guild_id] = rest_urls
+
+    try:
+        info = await _extract_audio(first_url)
     except Exception as e:
         await ctx.reply(f"ดึงเสียงไม่สำเร็จครับ: {e}")
         return
 
-    _play_source(ctx.guild, vc, info, query)
+    _play_source(ctx.guild, vc, info, first_url)
     kind = "🔴 ไลฟ์สด" if info.get("is_live") else "🎵 คลิป"
-    await ctx.reply(f"{kind} กำลังเล่น: **{info.get('title', 'ไม่ทราบชื่อ')}**")
+    extra = f" (+ อีก {len(rest_urls)} เพลงในคิว)" if rest_urls else ""
+    await ctx.reply(f"{kind} กำลังเล่น: **{info.get('title', 'ไม่ทราบชื่อ')}**{extra}")
+
+
+@bot.command(name="skip")
+async def skip_cmd(ctx):
+    """s.skip -> ข้ามไปเล่นเพลงถัดไปในคิว (ถ้ามี)"""
+    vc = ctx.voice_client
+    if vc is None or not (vc.is_playing() or vc.is_paused()):
+        await ctx.reply("ตอนนี้ไม่มีอะไรกำลังเล่นอยู่ครับ")
+        return
+
+    guild_id = ctx.guild.id
+    now = state["now_playing"].get(guild_id)
+    if now:
+        now["loop"] = False  # ข้ามเพลงปัจจุบัน ไม่ต้องวนซ้ำเพลงเดิม
+
+    if not state["queue"].get(guild_id):
+        await ctx.reply("⏭️ ข้ามเพลงนี้แล้ว (คิวว่าง เลยจะหยุดเงียบๆ)")
+    else:
+        await ctx.reply("⏭️ ข้ามไปเพลงถัดไป...")
+
+    vc.stop()  # จะไปเข้า _on_track_end แล้วเล่นคิวถัดไปเองถ้ามี
+
+
+@bot.command(name="queue")
+async def queue_cmd(ctx):
+    """s.queue -> ดูคิวเพลงที่รอเล่นอยู่"""
+    guild_id = ctx.guild.id
+    now = state["now_playing"].get(guild_id)
+    q = state["queue"].get(guild_id) or []
+
+    lines = []
+    if now and now.get("title"):
+        lines.append(f"▶️ กำลังเล่น: **{now['title']}**")
+    else:
+        lines.append("▶️ ตอนนี้ไม่มีอะไรกำลังเล่นอยู่")
+
+    if q:
+        lines.append(f"\n📃 คิวถัดไป ({len(q)} เพลง):")
+        for i, u in enumerate(q[:10], start=1):
+            lines.append(f"`{i}.` {u}")
+        if len(q) > 10:
+            lines.append(f"... และอีก {len(q) - 10} เพลง")
+    else:
+        lines.append("\n📃 คิวว่างเปล่าครับ")
+
+    await ctx.reply("\n".join(lines))
 
 
 @bot.command(name="loop")
@@ -209,18 +293,50 @@ async def loop_cmd(ctx, mode: str = None):
 
 @bot.command(name="stop")
 async def stop_cmd(ctx):
-    """s.stop -> หยุดเล่นเพลง (ยังอยู่ในห้องเสียง ไม่ออก)"""
+    """s.stop -> หยุดเล่นเพลงและล้างคิวทั้งหมด (ยังอยู่ในห้องเสียง ไม่ออก)"""
     vc = ctx.voice_client
     if vc is None or not (vc.is_playing() or vc.is_paused()):
         await ctx.reply("ตอนนี้ไม่มีอะไรกำลังเล่นอยู่ครับ")
         return
 
-    now = state["now_playing"].get(ctx.guild.id)
+    guild_id = ctx.guild.id
+    now = state["now_playing"].get(guild_id)
     if now:
         now["loop"] = False  # กันไม่ให้ after-callback สั่งเล่นซ้ำหลังหยุด
 
+    state["queue"][guild_id] = []          # ล้างคิวทั้งหมด
+    state["stop_flag"][guild_id] = True    # กันไม่ให้ after-callback เล่นคิวถัดไป
+
     vc.stop()
-    await ctx.reply("⏹️ หยุดเล่นเพลงแล้ว")
+    await ctx.reply("⏹️ หยุดเล่นเพลงและล้างคิวแล้ว")
+
+
+async def _resolve_urls(query: str) -> list:
+    """เช็คว่า query เป็นเพลย์ลิสต์หรือเพลงเดี่ยว แล้วคืนลิสต์ของ url ที่จะเล่น
+    ใช้ extract_flat เพื่อดึงแค่รายชื่อ/ลิงก์แบบเร็วๆ ไม่ต้อง resolve สตรีมจริง
+    ของทุกเพลงตั้งแต่ตอนนี้ (จะไป resolve ทีละเพลงตอนใกล้ถึงคิวจริงๆ แทน)"""
+    loop = asyncio.get_running_loop()
+
+    def _run():
+        opts = dict(YDL_OPTS)
+        opts["extract_flat"] = "in_playlist"
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(query, download=False)
+            entries = data.get("entries")
+            if entries is None:
+                # เพลงเดี่ยว ไม่ใช่เพลย์ลิสต์/ผลค้นหาแบบหลายรายการ
+                return [data.get("webpage_url", query)]
+            entries = list(entries)
+            urls = []
+            for e in entries:
+                if not e:
+                    continue
+                u = e.get("webpage_url") or e.get("url") or e.get("id")
+                if u:
+                    urls.append(u)
+            return urls
+
+    return await loop.run_in_executor(None, _run)
 
 
 async def _extract_audio(query: str) -> dict:
@@ -275,19 +391,42 @@ def _play_source(guild, vc, info, original_query):
 
 
 async def _on_track_end(guild, vc, original_query):
-    """เรียกตอนคลิปจบ -> ถ้าเปิด loop ไว้ ให้ดึงสตรีมใหม่มาเล่นต่อ (ลิงก์เสียงของ YouTube หมดอายุได้)"""
-    now = state["now_playing"].get(guild.id)
-    if not now or not now.get("loop"):
+    """เรียกตอนเพลงจบหรือถูกสั่งหยุด/ข้าม -> ตัดสินใจว่าจะทำอะไรต่อ:
+    1. ถ้าเพิ่งสั่ง s.stop มา -> ไม่ทำอะไรเลย
+    2. ถ้าเปิด loop ไว้ -> เล่นเพลงเดิมซ้ำ (ดึงสตรีมใหม่เพราะลิงก์เก่าอาจหมดอายุ)
+    3. ถ้ามีคิวเหลืออยู่ -> เล่นเพลงถัดไปในคิว
+    4. ไม่งั้นก็หยุดเงียบๆ (ยังอยู่ในห้องเสียงต่อ)"""
+    guild_id = guild.id
+
+    if state["stop_flag"].get(guild_id):
+        state["stop_flag"][guild_id] = False
         return
+
     if vc is None or not vc.is_connected():
         return
 
-    try:
-        info = await _extract_audio(original_query)
-        _play_source(guild, vc, info, original_query)
-        print(f"[{guild.name}] loop: เล่นซ้ำ '{info.get('title')}'")
-    except Exception as e:
-        print(f"[{guild.name}] loop ล้มเหลว: {e}")
+    now = state["now_playing"].get(guild_id)
+    if now and now.get("loop"):
+        try:
+            info = await _extract_audio(original_query)
+            _play_source(guild, vc, info, original_query)
+            print(f"[{guild.name}] loop: เล่นซ้ำ '{info.get('title')}'")
+        except Exception as e:
+            print(f"[{guild.name}] loop ล้มเหลว: {e}")
+        return
+
+    queue = state["queue"].get(guild_id) or []
+    while queue:
+        next_url = queue.pop(0)
+        try:
+            info = await _extract_audio(next_url)
+            _play_source(guild, vc, info, next_url)
+            print(f"[{guild.name}] คิว: เล่นต่อ '{info.get('title')}'")
+            return
+        except Exception as e:
+            print(f"[{guild.name}] เล่นเพลงถัดไปในคิวล้มเหลว ({next_url}): {e} -> ข้ามไปเพลงถัดไป")
+            continue
+    # คิวหมดแล้ว หรือไม่มีคิว -> เงียบไว้เฉยๆ ยังอยู่ในห้อง
 
 
 @bot.command(name="help")
@@ -296,11 +435,14 @@ async def help_cmd(ctx):
     text = (
         "**คำสั่งทั้งหมด (prefix: `s.` หรือ `S.`)**\n"
         "`s.join`   - เข้าห้องเสียงตามผู้เรียกคำสั่ง\n"
-        "`s.leave`  - ออกจากห้องเสียง\n"
+        "`s.leave`  - ออกจากห้องเสียง (ล้างคิวด้วย)\n"
         "`s.status` - เช็คเวลาที่อยู่ในห้องเสียงตอนนี้\n"
-        "`s.play <ลิงก์/คำค้นหา>` - เล่นเสียงจาก YouTube (รองรับคลิปยาว/ไลฟ์สด)\n"
-        "`s.loop on/off` - เปิด/ปิดวนซ้ำอัตโนมัติเมื่อคลิปจบ\n"
-        "`s.stop`   - หยุดเล่นเพลง (ไม่ออกจากห้อง)\n"
+        "`s.play <ลิงก์/คำค้นหา>` - เล่นเสียง (ค้นหาเริ่มต้นจาก SoundCloud) "
+        "วางลิงก์เพลย์ลิสต์ได้ จะต่อคิวเล่นให้ทั้งหมด\n"
+        "`s.queue` - ดูคิวเพลงที่รอเล่นอยู่\n"
+        "`s.skip`  - ข้ามไปเพลงถัดไปในคิว\n"
+        "`s.loop on/off` - เปิด/ปิดวนซ้ำเพลงปัจจุบันเมื่อจบ\n"
+        "`s.stop`   - หยุดเล่นเพลงและล้างคิวทั้งหมด (ไม่ออกจากห้อง)\n"
         "`s.help`   - แสดงข้อความนี้\n"
     )
     await ctx.reply(text)
@@ -732,11 +874,13 @@ DASHBOARD_HTML = """
 
 FEATURES = [
     {"name": "s.join", "desc": "เข้าห้องเสียงตามผู้เรียกคำสั่ง"},
-    {"name": "s.leave", "desc": "ออกจากห้องเสียงทันที"},
+    {"name": "s.leave", "desc": "ออกจากห้องเสียงทันที (ล้างคิว)"},
     {"name": "s.status", "desc": "เช็คห้อง/เวลาที่สิงอยู่ตอนนี้"},
-    {"name": "s.play", "desc": "เล่นเสียงจาก YouTube (คลิปยาว/ไลฟ์สด)"},
-    {"name": "s.loop", "desc": "วนซ้ำอัตโนมัติเมื่อคลิปจบ (s.loop on/off)"},
-    {"name": "s.stop", "desc": "หยุดเล่นเพลง โดยไม่ออกจากห้อง"},
+    {"name": "s.play", "desc": "เล่นเสียงจาก SoundCloud ฯลฯ (รองรับเพลย์ลิสต์ต่อคิว)"},
+    {"name": "s.queue", "desc": "ดูคิวเพลงที่รอเล่นอยู่"},
+    {"name": "s.skip", "desc": "ข้ามไปเพลงถัดไปในคิว"},
+    {"name": "s.loop", "desc": "วนซ้ำเพลงปัจจุบันเมื่อจบ (s.loop on/off)"},
+    {"name": "s.stop", "desc": "หยุดเล่นเพลง + ล้างคิว โดยไม่ออกจากห้อง"},
     {"name": "s.help", "desc": "แสดงคำสั่งทั้งหมด"},
     {"name": "auto-reconnect", "desc": "ต่อกลับอัตโนมัติถ้าหลุดเพราะเน็ต (สูงสุด 5 ครั้ง)"},
     {"name": "respect-kick", "desc": "ไม่ฝืนกลับเข้าห้อง ถ้าแอดมินถอดสิทธิ์ Connect"},
