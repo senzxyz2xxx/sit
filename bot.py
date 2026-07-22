@@ -38,6 +38,16 @@ YDL_OPTS = {
     },
 }
 
+# ถ้ามีไฟล์ cookies.txt (อัปโหลดเป็น Secret File บน Render ที่ path นี้) ให้ใช้
+# cookies ช่วยยืนยันตัวตนกับ YouTube ด้วย จะช่วยแก้ error "Sign in to confirm
+# you're not a bot" ได้เสถียรกว่าวิธี player_client เฉยๆ
+COOKIES_PATH = os.environ.get("YTDLP_COOKIES_PATH", "/etc/secrets/cookies.txt")
+if os.path.isfile(COOKIES_PATH):
+    YDL_OPTS["cookiefile"] = COOKIES_PATH
+    print(f"[YT-DLP] พบไฟล์ cookies ที่ {COOKIES_PATH} -> ใช้ยืนยันตัวตนกับ YouTube")
+else:
+    print(f"[YT-DLP] ไม่พบไฟล์ cookies ที่ {COOKIES_PATH} -> รันแบบไม่มี cookies (อาจเจอ error bot-check)")
+
 FFMPEG_BEFORE_OPTS = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 )
