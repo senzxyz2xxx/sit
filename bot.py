@@ -22,18 +22,23 @@ PORT = int(os.environ.get("PORT", 10000))
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
 YDL_OPTS = {
-    "format": "bestaudio/best",
+    # bestaudio/best เดิมบางทีเจอ error "Requested format is not available"
+    # เพราะ format ที่ต้องการไม่มีในลิสต์ที่ client นั้นคืนมา เปลี่ยนเป็นแบบ
+    # ยืดหยุ่นกว่านี้ ให้ลองหา best audio-only ก่อน ถ้าไม่มีจริงๆ ค่อย fallback
+    # ไปเอาไฟล์ที่ดีที่สุดที่มี (มีวิดีโอติดมาด้วยก็ไม่เป็นไร เพราะฝั่ง ffmpeg
+    # ใช้ -vn ตัดภาพทิ้งอยู่แล้ว)
+    "format": "bestaudio*/bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "default_search": "auto",
     "source_address": "0.0.0.0",
-    # ใช้ client แบบ web เป็นหลัก (ตอนนี้มี cookies ช่วยยืนยันตัวตนแล้ว ไม่ต้องพึ่ง
-    # android client ซึ่งบางคลิปจะไม่มี format เสียงให้เลือกครบ ทำให้เจอ error
-    # "Requested format is not available")
+    # ใช้ client แบบ web เพียวๆ (มี cookies ช่วยยืนยันตัวตนแล้ว) การผสมหลาย
+    # client พร้อมกัน (web+android) บางทีทำให้ format list ปนกันจน selector
+    # หาไฟล์ที่ตรงเงื่อนไขไม่เจอ
     "extractor_args": {
         "youtube": {
-            "player_client": ["web", "android"],
+            "player_client": ["web"],
         }
     },
 }
