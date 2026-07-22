@@ -19,8 +19,21 @@ import imageio_ffmpeg
 TOKEN = os.environ.get("DISCORD_TOKEN")
 PORT = int(os.environ.get("PORT", 10000))
 
-# imageio-ffmpeg มัด static ffmpeg binary มาให้เลย ไม่ต้องพึ่ง apt-get บน Render
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+# ffmpeg binary:
+# เดิมใช้ imageio_ffmpeg.get_ffmpeg_exe() (static binary ที่มัดมากับ package)
+# อย่างเดียว แต่บน Render บาง instance binary ตัวนี้ segfault (FFmpeg exited
+# with code -11 = SIGSEGV) ทุกครั้งไม่ว่าจะเล่นไฟล์อะไรก็ตาม
+# -> แก้โดยให้ลองหา ffmpeg ที่ติดตั้งในระบบ (ผ่าน apt-get ตอน build) ก่อน
+# ถ้าไม่เจอค่อย fallback ไปใช้ตัวจาก imageio_ffmpeg เหมือนเดิม
+import shutil as _shutil_ffmpeg_check
+
+_system_ffmpeg = _shutil_ffmpeg_check.which("ffmpeg")
+if _system_ffmpeg:
+    FFMPEG_PATH = _system_ffmpeg
+    print(f"[FFMPEG] ใช้ ffmpeg ของระบบที่: {FFMPEG_PATH}")
+else:
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+    print(f"[FFMPEG] ไม่พบ ffmpeg ของระบบ -> ใช้ imageio_ffmpeg แทนที่: {FFMPEG_PATH}")
 
 YDL_OPTS = {
     # bestaudio/best เดิมบางทีเจอ error "Requested format is not available"
@@ -73,7 +86,10 @@ else:
 FFMPEG_BEFORE_OPTS = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 )
-FFMPEG_OPTS = "-vn"
+# เพิ่ม -loglevel warning เพื่อให้เห็น error จริงจาก ffmpeg เวลามีปัญหา
+# (เดิม stderr=subprocess.PIPE ที่ส่งให้ FFmpegPCMAudio ไม่มีผลอะไรเลยใน
+# discord.py เวอร์ชันใหม่ๆ เลยไม่เคยเห็น stderr จริงๆ สักที)
+FFMPEG_OPTS = "-vn -loglevel warning"
 
 # รองรับ prefix ทั้ง s. และ S.
 def get_prefix(bot_, message):
@@ -381,9 +397,11 @@ def _play_source(guild, vc, info, original_query):
         executable=FFMPEG_PATH,
         before_options=before_opts,
         options=FFMPEG_OPTS,
-        # เอา stderr ของ ffmpeg มาโชว์ใน log ด้วย เผื่อเงียบไม่มีเสียงแบบไม่มี error
-        # อีก จะได้เห็นสาเหตุจริงใน Render logs
-        stderr=subprocess.PIPE,
+        # หมายเหตุ: เอา stderr=subprocess.PIPE ออกแล้ว เพราะ discord.py
+        # เวอร์ชันใหม่ๆ ไม่รองรับ kwarg นี้จริง (เป็น no-op และมี
+        # DeprecationWarning เตือนอยู่แล้ว) ให้ ffmpeg log ผ่าน stderr
+        # ปกติของ process แม่ (เห็นใน Render logs โดยตรง) แทน พร้อมกับ
+        # -loglevel warning ใน FFMPEG_OPTS เพื่อให้เห็นสาเหตุจริงถ้าเกิด error
     )
 
     existing = state["now_playing"].get(guild.id)
@@ -399,14 +417,6 @@ def _play_source(guild, vc, info, original_query):
     def _after(error):
         if error:
             print(f"[{guild.name}] เล่นเพลงเจอ error: {error}")
-        # โชว์ stderr ของ ffmpeg ท้ายๆ ไว้ debug เผื่อเงียบไม่มีเสียงแบบไม่มี error
-        try:
-            if source._process and source._process.stderr:
-                tail = source._process.stderr.read()
-                if tail:
-                    print(f"[{guild.name}] ffmpeg stderr (tail): {tail.decode(errors='ignore')[-1500:]}")
-        except Exception:
-            pass
         fut = asyncio.run_coroutine_threadsafe(_on_track_end(guild, vc, original_query), bot.loop)
         try:
             fut.result()
