@@ -28,6 +28,14 @@ YDL_OPTS = {
     "no_warnings": True,
     "default_search": "auto",
     "source_address": "0.0.0.0",
+    # แก้ error "Sign in to confirm you're not a bot" ที่มักเจอตอนรันบน
+    # เซิร์ฟเวอร์คลาวด์ (IP ของ datacenter โดน YouTube เพ่งเล็งว่าอาจเป็นบอท)
+    # โดยสั่งให้ yt-dlp ดึงข้อมูลผ่าน client แบบ android ก่อน แล้วค่อย fallback ไป web
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+        }
+    },
 }
 
 FFMPEG_BEFORE_OPTS = (
@@ -254,8 +262,9 @@ async def _on_track_end(guild, vc, original_query):
         print(f"[{guild.name}] loop ล้มเหลว: {e}")
 
 
-
+@bot.command(name="help")
 async def help_cmd(ctx):
+    """s.help หรือ S.help -> แสดงคำสั่งทั้งหมด"""
     text = (
         "**คำสั่งทั้งหมด (prefix: `s.` หรือ `S.`)**\n"
         "`s.join`   - เข้าห้องเสียงตามผู้เรียกคำสั่ง\n"
