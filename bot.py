@@ -2,17 +2,38 @@ import os
 import time
 import asyncio
 import threading
+import functools
 from datetime import datetime, timezone
 
 import discord
 from discord.ext import commands
 from flask import Flask, jsonify, render_template_string
 
+import yt_dlp
+import imageio_ffmpeg
+
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
 TOKEN = os.environ.get("DISCORD_TOKEN")
 PORT = int(os.environ.get("PORT", 10000))
+
+# imageio-ffmpeg มัด static ffmpeg binary มาให้เลย ไม่ต้องพึ่ง apt-get บน Render
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
+YDL_OPTS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "auto",
+    "source_address": "0.0.0.0",
+}
+
+FFMPEG_BEFORE_OPTS = (
+    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+)
+FFMPEG_OPTS = "-vn"
 
 # รองรับ prefix ทั้ง s. และ S.
 def get_prefix(bot_, message):
@@ -30,7 +51,8 @@ state = {
     "bot_ready": False,
     "bot_user": None,
     "start_time": time.time(),
-    "sessions": {},   # guild_id -> {guild_name, channel_name, channel_id, join_time, status}
+    "sessions": {},      # guild_id -> {guild_name, channel_name, channel_id, join_time, status}
+    "now_playing": {},   # guild_id -> {title, url, loop, source_url}
 }
 
 RECONNECT_MAX_RETRY = 5
@@ -75,6 +97,7 @@ async def leave_cmd(ctx):
         return
     await vc.disconnect(force=True)
     _clear_session(ctx.guild.id)
+    state["now_playing"].pop(ctx.guild.id, None)
     await ctx.reply("ออกจากห้องเสียงแล้ว 👋")
 
 
@@ -93,13 +116,154 @@ async def status_cmd(ctx):
     )
 
 
-@bot.command(name="help")
+@bot.command(name="play")
+async def play_cmd(ctx, *, query: str = None):
+    """s.play <ลิงก์ยูทูป หรือ คำค้นหา> -> เล่นเสียงในห้องเสียง (รองรับคลิปยาว/ไลฟ์สด)"""
+    if not query:
+        await ctx.reply("ใส่ลิงก์หรือคำค้นหาด้วยครับ เช่น `s.play https://youtu.be/xxxx`")
+        return
+
+    # เข้าห้องเสียงก่อนถ้ายังไม่เข้า
+    vc = ctx.voice_client
+    if vc is None:
+        if ctx.author.voice is None or ctx.author.voice.channel is None:
+            await ctx.reply("ต้องเข้าห้องเสียงก่อน บอทถึงจะตามเข้าไปเล่นเพลงให้ได้ครับ")
+            return
+        channel = ctx.author.voice.channel
+        vc = await channel.connect(reconnect=True, self_deaf=True)
+        _record_join(ctx.guild, channel)
+
+    await ctx.reply(f"🔎 กำลังค้นหา/ดึงสตรีมเสียง: `{query}` ...")
+
+    try:
+        info = await _extract_audio(query)
+    except Exception as e:
+        await ctx.reply(f"ดึงเสียงไม่สำเร็จครับ: {e}")
+        return
+
+    _play_source(ctx.guild, vc, info, query)
+    kind = "🔴 ไลฟ์สด" if info.get("is_live") else "🎵 คลิป"
+    await ctx.reply(f"{kind} กำลังเล่น: **{info.get('title', 'ไม่ทราบชื่อ')}**")
+
+
+@bot.command(name="loop")
+async def loop_cmd(ctx, mode: str = None):
+    """s.loop on/off -> เปิด/ปิดการวนซ้ำอัตโนมัติเมื่อคลิปจบ"""
+    guild_id = ctx.guild.id
+    now = state["now_playing"].get(guild_id)
+
+    if mode is None:
+        current = bool(now and now.get("loop"))
+        await ctx.reply(f"ตอนนี้ loop: {'เปิดอยู่ ✅' if current else 'ปิดอยู่ ❌'} (ใช้ `s.loop on` หรือ `s.loop off`)")
+        return
+
+    mode = mode.lower()
+    if mode not in ("on", "off"):
+        await ctx.reply("พิมพ์ `s.loop on` หรือ `s.loop off` ครับ")
+        return
+
+    if now is None:
+        # ยังไม่มีอะไรเล่นอยู่ ก็เก็บ preference ไว้ก่อนสำหรับเพลงถัดไป
+        state["now_playing"][guild_id] = {"title": None, "url": None, "loop": (mode == "on"), "source_url": None}
+    else:
+        now["loop"] = (mode == "on")
+
+    await ctx.reply(f"ตั้งค่า loop เป็น {'เปิด ✅' if mode == 'on' else 'ปิด ❌'} แล้วครับ")
+
+
+@bot.command(name="stop")
+async def stop_cmd(ctx):
+    """s.stop -> หยุดเล่นเพลง (ยังอยู่ในห้องเสียง ไม่ออก)"""
+    vc = ctx.voice_client
+    if vc is None or not (vc.is_playing() or vc.is_paused()):
+        await ctx.reply("ตอนนี้ไม่มีอะไรกำลังเล่นอยู่ครับ")
+        return
+
+    now = state["now_playing"].get(ctx.guild.id)
+    if now:
+        now["loop"] = False  # กันไม่ให้ after-callback สั่งเล่นซ้ำหลังหยุด
+
+    vc.stop()
+    await ctx.reply("⏹️ หยุดเล่นเพลงแล้ว")
+
+
+async def _extract_audio(query: str) -> dict:
+    """ดึงข้อมูล/สตรีม URL เสียงจาก yt-dlp (รันใน thread executor เพราะเป็น blocking call)"""
+    loop = asyncio.get_running_loop()
+
+    def _run():
+        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+            data = ydl.extract_info(query, download=False)
+            if "entries" in data:  # กรณีเป็นผลค้นหา ให้เอาอันแรก
+                data = data["entries"][0]
+            return {
+                "title": data.get("title"),
+                "webpage_url": data.get("webpage_url", query),
+                "stream_url": data.get("url"),
+                "is_live": bool(data.get("is_live")),
+            }
+
+    return await loop.run_in_executor(None, _run)
+
+
+def _play_source(guild, vc, info, original_query):
+    source = discord.FFmpegPCMAudio(
+        info["stream_url"],
+        executable=FFMPEG_PATH,
+        before_options=FFMPEG_BEFORE_OPTS,
+        options=FFMPEG_OPTS,
+    )
+
+    existing = state["now_playing"].get(guild.id)
+    loop_pref = bool(existing.get("loop")) if existing else False
+
+    state["now_playing"][guild.id] = {
+        "title": info.get("title"),
+        "url": info.get("webpage_url", original_query),
+        "loop": loop_pref,
+        "source_url": original_query,
+    }
+
+    def _after(error):
+        if error:
+            print(f"[{guild.name}] เล่นเพลงเจอ error: {error}")
+        fut = asyncio.run_coroutine_threadsafe(_on_track_end(guild, vc, original_query), bot.loop)
+        try:
+            fut.result()
+        except Exception as e:
+            print(f"[{guild.name}] after-callback error: {e}")
+
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+    vc.play(source, after=_after)
+
+
+async def _on_track_end(guild, vc, original_query):
+    """เรียกตอนคลิปจบ -> ถ้าเปิด loop ไว้ ให้ดึงสตรีมใหม่มาเล่นต่อ (ลิงก์เสียงของ YouTube หมดอายุได้)"""
+    now = state["now_playing"].get(guild.id)
+    if not now or not now.get("loop"):
+        return
+    if vc is None or not vc.is_connected():
+        return
+
+    try:
+        info = await _extract_audio(original_query)
+        _play_source(guild, vc, info, original_query)
+        print(f"[{guild.name}] loop: เล่นซ้ำ '{info.get('title')}'")
+    except Exception as e:
+        print(f"[{guild.name}] loop ล้มเหลว: {e}")
+
+
+
 async def help_cmd(ctx):
     text = (
         "**คำสั่งทั้งหมด (prefix: `s.` หรือ `S.`)**\n"
         "`s.join`   - เข้าห้องเสียงตามผู้เรียกคำสั่ง\n"
         "`s.leave`  - ออกจากห้องเสียง\n"
         "`s.status` - เช็คเวลาที่อยู่ในห้องเสียงตอนนี้\n"
+        "`s.play <ลิงก์/คำค้นหา>` - เล่นเสียงจาก YouTube (รองรับคลิปยาว/ไลฟ์สด)\n"
+        "`s.loop on/off` - เปิด/ปิดวนซ้ำอัตโนมัติเมื่อคลิปจบ\n"
+        "`s.stop`   - หยุดเล่นเพลง (ไม่ออกจากห้อง)\n"
         "`s.help`   - แสดงข้อความนี้\n"
     )
     await ctx.reply(text)
@@ -371,6 +535,26 @@ DASHBOARD_HTML = """
     50% { transform: scaleY(1); opacity: 1; }
   }
 
+  .now-playing {
+    margin-top: 0.6rem;
+    padding-top: 0.6rem;
+    border-top: 1px dashed var(--panel-line);
+    font-size: 0.82rem;
+    color: var(--mint);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .loop-tag {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.65rem;
+    background: rgba(79,217,191,0.12);
+    color: var(--mint);
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    letter-spacing: 0.08em;
+  }
+
   .empty {
     background: var(--panel);
     border: 1px dashed var(--panel-line);
@@ -470,6 +654,11 @@ DASHBOARD_HTML = """
             <span></span><span></span><span></span><span></span><span></span>
             <span></span><span></span><span></span><span></span><span></span>
           </div>
+          {% if s.now_playing %}
+          <div class="now-playing">
+            🎵 {{ s.now_playing }} {% if s.loop_on %}<span class="loop-tag">LOOP</span>{% endif %}
+          </div>
+          {% endif %}
         </div>
         {% endfor %}
       {% else %}
@@ -508,6 +697,9 @@ FEATURES = [
     {"name": "s.join", "desc": "เข้าห้องเสียงตามผู้เรียกคำสั่ง"},
     {"name": "s.leave", "desc": "ออกจากห้องเสียงทันที"},
     {"name": "s.status", "desc": "เช็คห้อง/เวลาที่สิงอยู่ตอนนี้"},
+    {"name": "s.play", "desc": "เล่นเสียงจาก YouTube (คลิปยาว/ไลฟ์สด)"},
+    {"name": "s.loop", "desc": "วนซ้ำอัตโนมัติเมื่อคลิปจบ (s.loop on/off)"},
+    {"name": "s.stop", "desc": "หยุดเล่นเพลง โดยไม่ออกจากห้อง"},
     {"name": "s.help", "desc": "แสดงคำสั่งทั้งหมด"},
     {"name": "auto-reconnect", "desc": "ต่อกลับอัตโนมัติถ้าหลุดเพราะเน็ต (สูงสุด 5 ครั้ง)"},
     {"name": "respect-kick", "desc": "ไม่ฝืนกลับเข้าห้อง ถ้าแอดมินถอดสิทธิ์ Connect"},
@@ -519,10 +711,13 @@ FEATURES = [
 def dashboard():
     sessions = []
     for gid, s in state["sessions"].items():
+        now = state["now_playing"].get(gid)
         sessions.append({
             "guild_name": s["guild_name"],
             "channel_name": s["channel_name"],
             "duration": _fmt_duration(time.time() - s["join_time"]),
+            "now_playing": now.get("title") if now else None,
+            "loop_on": bool(now.get("loop")) if now else False,
         })
     return render_template_string(
         DASHBOARD_HTML,
