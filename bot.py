@@ -1,28 +1,3 @@
-"""
-Voice Presence Bot (single-file)
---------------------------------
-วัตถุประสงค์: เข้าห้องเสียงใน Discord เพื่อ "เก็บสถิติเวลา" (uptime tracking)
-มี dashboard (Flask) แสดงสถานะบอท / ห้อง / เซิร์ฟเวอร์ / เวลาที่เข้าห้อง
-
-Prefix: s. และ S. ใช้ได้ทั้งคู่
-
-หมายเหตุด้านจริยธรรม/ความปลอดภัย (สำคัญ):
-- บอทนี้จะพยายามเชื่อมต่อใหม่อัตโนมัติ "เฉพาะกรณีหลุดเพราะปัญหาเครือข่าย/error ชั่วคราว"
-- ถ้าแอดมิน/ผู้ดูแลเซิร์ฟเวอร์ "เตะ" บอทออกจากห้องเสียงโดยตั้งใจ (ถอดสิทธิ์ Connect,
-  ย้ายบอทออกแล้วปิดสิทธิ์, หรือ disconnect ผ่านสิทธิ์ผู้ดูแล) บอทจะไม่ฝืนเข้าไปใหม่ทันที
-  เพราะการเขียนให้ "ต้านคำสั่งของผู้ดูแลเซิร์ฟเวอร์" ถือเป็นการละเมิดสิทธิ์เจ้าของเซิร์ฟเวอร์
-  และขัด Discord ToS - ส่วนนี้ถูกออกแบบมาให้เคารพผู้ดูแลเซิร์ฟเวอร์เสมอ
-
-ENV VARS ที่ต้องตั้งบน Render:
-  DISCORD_TOKEN   -> token ของบอท (จำเป็น)
-  PORT            -> Render จะตั้งให้อัตโนมัติ (ไม่ต้องตั้งเอง)
-
-Requirements (ใส่ใน requirements.txt แยกต่างหาก):
-  discord.py[voice]
-  PyNaCl
-  Flask
-"""
-
 import os
 import time
 import asyncio
@@ -149,6 +124,14 @@ async def on_voice_state_update(member, before, after):
         if session is None:
             return
 
+        # ถ้า discord.py ยังมี VoiceClient ของกิลด์นี้อยู่ (guild.voice_client ไม่ใช่ None)
+        # แปลว่ามันกำลังจัดการ reconnect ของตัวเองอยู่แล้ว (เห็นใน log ว่ามี
+        # "Starting voice handshake... attempt N" เองอัตโนมัติ) -> ห้ามยิง connect()
+        # ซ้ำเข้าไปอีก ไม่งั้นจะมี session แย่งกัน 2 ชุดจนได้ error 4006 วนลูป
+        if guild.voice_client is not None:
+            print(f"[{guild.name}] discord.py กำลัง reconnect เองอยู่แล้ว -> ไม่ยุ่ง")
+            return
+
         # เช็คว่าบอทยังมีสิทธิ์ Connect ในห้องเดิมอยู่ไหม
         # ถ้าแอดมินถอดสิทธิ์ Connect ออก แปลว่าตั้งใจเตะ -> เคารพสิทธิ์ ไม่ฝืนเข้า
         old_channel = before.channel
@@ -160,13 +143,20 @@ async def on_voice_state_update(member, before, after):
             _clear_session(guild.id)
             return
 
-        # ลอง reconnect แบบจำกัดจำนวนครั้ง (สมมติว่าหลุดเพราะเน็ต/ปัญหาโหนดเสียงชั่วคราว)
+        # ถึงตรงนี้แปลว่าหลุดแบบสมบูรณ์จริงๆ (ไม่มี voice_client เหลืออยู่เลย) และยังมีสิทธิ์อยู่
+        # ค่อยลอง reconnect เองแบบจำกัดจำนวนครั้ง
         asyncio.create_task(_try_reconnect(guild, old_channel))
 
 
 async def _try_reconnect(guild, channel):
     for attempt in range(1, RECONNECT_MAX_RETRY + 1):
         await asyncio.sleep(RECONNECT_DELAY_SEC)
+
+        # ถ้าระหว่างรอ มี voice_client โผล่มาแล้ว (เช่นคนสั่ง s.join เอง หรือ
+        # discord.py auto-reconnect ของ session เดิมกลับมาทำงาน) ให้เลิกพยายามเอง
+        if guild.voice_client is not None:
+            print(f"[{guild.name}] มี voice_client อยู่แล้ว -> เลิกพยายาม reconnect เอง")
+            return
 
         # เช็คสิทธิ์ใหม่ทุกรอบ เผื่อผู้ดูแลเพิ่งเปลี่ยนสิทธิ์
         me = guild.me
@@ -177,7 +167,7 @@ async def _try_reconnect(guild, channel):
             return
 
         try:
-            await channel.connect(reconnect=True, self_deaf=True)
+            await channel.connect(reconnect=True, self_deaf=True, timeout=15)
             _record_join(guild, channel)
             print(f"[{guild.name}] reconnect สำเร็จ (ครั้งที่ {attempt})")
             return
@@ -229,52 +219,300 @@ DASHBOARD_HTML = """
 <html lang="th">
 <head>
 <meta charset="UTF-8">
-<title>Voice Presence Bot - Dashboard</title>
-<meta http-equiv="refresh" content="5">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Presence Console</title>
+<meta http-equiv="refresh" content="8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
-  body { font-family: sans-serif; background:#1e1f22; color:#e3e5e8; padding:2rem; }
-  h1 { color:#5865f2; }
-  .card { background:#2b2d31; border-radius:10px; padding:1rem 1.5rem; margin-bottom:1rem; }
-  .ok { color:#3ba55d; font-weight:bold; }
-  .bad { color:#ed4245; font-weight:bold; }
-  table { width:100%; border-collapse:collapse; }
-  td, th { padding:6px 10px; text-align:left; border-bottom:1px solid #3f4147; }
-  .muted { color:#949ba4; font-size:0.85rem; }
+  :root {
+    --bg: #10141b;
+    --panel: #1a212c;
+    --panel-line: #2a3444;
+    --amber: #e8a33d;
+    --amber-dim: #6b5330;
+    --mint: #4fd9bf;
+    --red: #e8654a;
+    --text: #e9edf3;
+    --text-mute: #7f8ba0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(circle at 15% 0%, rgba(232,163,61,0.06), transparent 45%),
+      var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    padding: 2.5rem 1.5rem 3rem;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; }
+
+  .console-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 1rem;
+    border-bottom: 1px solid var(--panel-line);
+    padding-bottom: 1.4rem;
+    margin-bottom: 1.8rem;
+  }
+  .eyebrow {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.18em;
+    color: var(--text-mute);
+    text-transform: uppercase;
+    margin: 0 0 0.5rem;
+  }
+  .callsign {
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700;
+    font-size: clamp(1.6rem, 4vw, 2.3rem);
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+  .status-block { text-align: right; }
+  .led-row { display: flex; align-items: center; gap: 0.5rem; justify-content: flex-end; }
+  .led {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--red);
+    box-shadow: 0 0 0 rgba(0,0,0,0);
+  }
+  .led.on {
+    background: var(--amber);
+    box-shadow: 0 0 10px 2px rgba(232,163,61,0.55);
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+  }
+  .status-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    letter-spacing: 0.06em;
+  }
+  .status-label.on { color: var(--amber); }
+  .status-label.off { color: var(--red); }
+  .uptime {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text-mute);
+    font-size: 0.78rem;
+    margin-top: 0.35rem;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1.5fr 1fr;
+    gap: 1.4rem;
+  }
+  @media (max-width: 760px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+
+  .panel-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--text-mute);
+    margin: 0 0 0.7rem;
+  }
+
+  .strip {
+    background: var(--panel);
+    border: 1px solid var(--panel-line);
+    border-left: 3px solid var(--amber);
+    border-radius: 8px;
+    padding: 1rem 1.15rem;
+    margin-bottom: 0.8rem;
+  }
+  .strip-top { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+  .strip-room {
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700;
+    font-size: 1.05rem;
+  }
+  .strip-guild { color: var(--text-mute); font-size: 0.82rem; margin-top: 0.15rem; }
+  .strip-time {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--mint);
+    font-size: 0.95rem;
+    white-space: nowrap;
+  }
+  .wave {
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 20px;
+    margin-top: 0.7rem;
+  }
+  .wave span {
+    width: 3px;
+    background: var(--amber-dim);
+    border-radius: 2px;
+    animation: bounce 1.1s ease-in-out infinite;
+  }
+  .wave span:nth-child(odd) { background: var(--amber); }
+  .wave span:nth-child(1){height:40%;animation-delay:0s}
+  .wave span:nth-child(2){height:80%;animation-delay:.1s}
+  .wave span:nth-child(3){height:55%;animation-delay:.2s}
+  .wave span:nth-child(4){height:95%;animation-delay:.3s}
+  .wave span:nth-child(5){height:35%;animation-delay:.4s}
+  .wave span:nth-child(6){height:70%;animation-delay:.5s}
+  .wave span:nth-child(7){height:50%;animation-delay:.6s}
+  .wave span:nth-child(8){height:85%;animation-delay:.7s}
+  .wave span:nth-child(9){height:40%;animation-delay:.8s}
+  .wave span:nth-child(10){height:65%;animation-delay:.9s}
+  @keyframes bounce {
+    0%, 100% { transform: scaleY(0.5); opacity: 0.7; }
+    50% { transform: scaleY(1); opacity: 1; }
+  }
+
+  .empty {
+    background: var(--panel);
+    border: 1px dashed var(--panel-line);
+    border-radius: 8px;
+    padding: 1.8rem 1.2rem;
+    text-align: center;
+    color: var(--text-mute);
+    font-size: 0.9rem;
+  }
+  .empty code {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--amber);
+    background: rgba(232,163,61,0.08);
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+  }
+
+  .rack {
+    background: var(--panel);
+    border: 1px solid var(--panel-line);
+    border-radius: 8px;
+    padding: 0.4rem 1rem;
+  }
+  .port {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    padding: 0.75rem 0;
+    border-bottom: 1px solid var(--panel-line);
+  }
+  .port:last-child { border-bottom: none; }
+  .port-num {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--text-mute);
+    width: 1.6rem;
+    flex-shrink: 0;
+  }
+  .port-body { flex: 1; }
+  .port-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    color: var(--text);
+  }
+  .port-desc { font-size: 0.78rem; color: var(--text-mute); margin-top: 0.1rem; }
+  .port-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--mint);
+    flex-shrink: 0;
+    box-shadow: 0 0 6px 1px rgba(79,217,191,0.5);
+  }
+
+  .footer-note {
+    margin-top: 1.6rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--text-mute);
+    text-align: center;
+    letter-spacing: 0.04em;
+  }
 </style>
 </head>
 <body>
-  <h1>🎧 Voice Presence Bot - Dashboard</h1>
-  <div class="card">
-    <p>สถานะบอท: {% if bot_ready %}<span class="ok">ONLINE</span>{% else %}<span class="bad">OFFLINE</span>{% endif %}</p>
-    <p>บัญชีบอท: {{ bot_user or "-" }}</p>
-    <p>เวลา uptime ของโปรเซส: {{ process_uptime }}</p>
-    <p class="muted">Prefix: s. หรือ S. | คำสั่ง: s.join, s.leave, s.status, s.help</p>
+<div class="wrap">
+
+  <div class="console-head">
+    <div>
+      <p class="eyebrow">Voice Presence Console</p>
+      <h1 class="callsign">{{ bot_user or "ยังไม่ได้เชื่อมต่อ" }}</h1>
+    </div>
+    <div class="status-block">
+      <div class="led-row">
+        <span class="led {% if bot_ready %}on{% endif %}"></span>
+        <span class="status-label {% if bot_ready %}on{% else %}off{% endif %}">
+          {% if bot_ready %}ON AIR{% else %}OFFLINE{% endif %}
+        </span>
+      </div>
+      <div class="uptime">PROCESS UPTIME · {{ process_uptime }}</div>
+    </div>
   </div>
 
-  <div class="card">
-    <h3>ห้องเสียงที่บอทกำลังสิงอยู่</h3>
-    {% if sessions %}
-    <table>
-      <tr><th>เซิร์ฟเวอร์</th><th>ห้องเสียง</th><th>เวลาที่สิง</th></tr>
-      {% for s in sessions %}
-      <tr>
-        <td>{{ s.guild_name }}</td>
-        <td>{{ s.channel_name }}</td>
-        <td>{{ s.duration }}</td>
-      </tr>
-      {% endfor %}
-    </table>
-    {% else %}
-    <p class="muted">ตอนนี้บอทยังไม่ได้เข้าห้องเสียงไหนเลย</p>
-    {% endif %}
+  <div class="grid">
+    <div>
+      <p class="panel-label">ห้องเสียงที่กำลังสิงอยู่ ({{ sessions|length }})</p>
+
+      {% if sessions %}
+        {% for s in sessions %}
+        <div class="strip">
+          <div class="strip-top">
+            <div>
+              <div class="strip-room">{{ s.channel_name }}</div>
+              <div class="strip-guild">{{ s.guild_name }}</div>
+            </div>
+            <div class="strip-time">{{ s.duration }}</div>
+          </div>
+          <div class="wave">
+            <span></span><span></span><span></span><span></span><span></span>
+            <span></span><span></span><span></span><span></span><span></span>
+          </div>
+        </div>
+        {% endfor %}
+      {% else %}
+        <div class="empty">
+          ยังไม่มีห้องเสียงที่บอทเข้าอยู่ตอนนี้<br>
+          พิมพ์ <code>s.join</code> หรือ <code>S.join</code> ในห้องเสียงที่ต้องการ
+        </div>
+      {% endif %}
+    </div>
+
+    <div>
+      <p class="panel-label">แผงคำสั่ง / ฟีเจอร์</p>
+      <div class="rack">
+        {% for f in features %}
+        <div class="port">
+          <span class="port-num">{{ "%02d"|format(loop.index) }}</span>
+          <div class="port-body">
+            <div class="port-name">{{ f.name }}</div>
+            <div class="port-desc">{{ f.desc }}</div>
+          </div>
+          <span class="port-dot"></span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
   </div>
 
-  <div class="card muted">
-    หน้านี้รีเฟรชอัตโนมัติทุก 5 วินาที
-  </div>
+  <p class="footer-note">PREFIX: s. หรือ S. &nbsp;·&nbsp; รีเฟรชอัตโนมัติทุก 8 วินาที &nbsp;·&nbsp; /api/status สำหรับ JSON</p>
+</div>
 </body>
 </html>
 """
+
+
+FEATURES = [
+    {"name": "s.join", "desc": "เข้าห้องเสียงตามผู้เรียกคำสั่ง"},
+    {"name": "s.leave", "desc": "ออกจากห้องเสียงทันที"},
+    {"name": "s.status", "desc": "เช็คห้อง/เวลาที่สิงอยู่ตอนนี้"},
+    {"name": "s.help", "desc": "แสดงคำสั่งทั้งหมด"},
+    {"name": "auto-reconnect", "desc": "ต่อกลับอัตโนมัติถ้าหลุดเพราะเน็ต (สูงสุด 5 ครั้ง)"},
+    {"name": "respect-kick", "desc": "ไม่ฝืนกลับเข้าห้อง ถ้าแอดมินถอดสิทธิ์ Connect"},
+    {"name": "/api/status", "desc": "ข้อมูลสถานะแบบ JSON สำหรับเชื่อมต่อระบบอื่น"},
+]
 
 
 @app.route("/")
@@ -292,6 +530,7 @@ def dashboard():
         bot_user=state["bot_user"],
         process_uptime=_fmt_duration(time.time() - state["start_time"]),
         sessions=sessions,
+        features=FEATURES,
     )
 
 
