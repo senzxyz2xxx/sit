@@ -33,13 +33,13 @@ YDL_OPTS = {
     "no_warnings": True,
     "default_search": "auto",
     "source_address": "0.0.0.0",
-    # ใช้ client แบบ mweb (mobile web) เพราะตอนนี้ YouTube เริ่มบังคับใช้ระบบ
-    # สตรีมแบบ SABR ซึ่งทำให้ client web/tv/ios คืนลิงก์เสียงตรงๆ ไม่ได้อีก
-    # (นี่คือปัญหาฝั่ง YouTube vs yt-dlp ที่กำลังแก้กันอยู่ ไม่ใช่บั๊กโค้ดเรา)
-    # mweb ยังใช้งานได้ดีกว่า client อื่นๆ ในตอนนี้
+    # ใช้หลาย client รวมกัน (yt-dlp จะลองทุกตัวแล้วรวม format ที่หาได้เข้าด้วยกัน)
+    # และสั่ง formats=missing_pot เพื่อบังคับเอา format ที่ปกติจะถูกข้ามไป
+    # (เพราะขาด PO Token ตามระบบ SABR ของ YouTube) กลับมาใช้ด้วย เผื่อเล่นได้
     "extractor_args": {
         "youtube": {
-            "player_client": ["mweb"],
+            "player_client": ["mweb", "android", "ios", "web"],
+            "formats": ["missing_pot"],
         }
     },
 }
