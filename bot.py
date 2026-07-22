@@ -28,12 +28,12 @@ YDL_OPTS = {
     "no_warnings": True,
     "default_search": "auto",
     "source_address": "0.0.0.0",
-    # แก้ error "Sign in to confirm you're not a bot" ที่มักเจอตอนรันบน
-    # เซิร์ฟเวอร์คลาวด์ (IP ของ datacenter โดน YouTube เพ่งเล็งว่าอาจเป็นบอท)
-    # โดยสั่งให้ yt-dlp ดึงข้อมูลผ่าน client แบบ android ก่อน แล้วค่อย fallback ไป web
+    # ใช้ client แบบ web เป็นหลัก (ตอนนี้มี cookies ช่วยยืนยันตัวตนแล้ว ไม่ต้องพึ่ง
+    # android client ซึ่งบางคลิปจะไม่มี format เสียงให้เลือกครบ ทำให้เจอ error
+    # "Requested format is not available")
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"],
+            "player_client": ["web", "android"],
         }
     },
 }
