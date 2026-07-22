@@ -38,15 +38,27 @@ YDL_OPTS = {
     },
 }
 
-# ถ้ามีไฟล์ cookies.txt (อัปโหลดเป็น Secret File บน Render ที่ path นี้) ให้ใช้
-# cookies ช่วยยืนยันตัวตนกับ YouTube ด้วย จะช่วยแก้ error "Sign in to confirm
-# you're not a bot" ได้เสถียรกว่าวิธี player_client เฉยๆ
-COOKIES_PATH = os.environ.get("YTDLP_COOKIES_PATH", "/etc/secrets/cookies.txt")
-if os.path.isfile(COOKIES_PATH):
-    YDL_OPTS["cookiefile"] = COOKIES_PATH
-    print(f"[YT-DLP] พบไฟล์ cookies ที่ {COOKIES_PATH} -> ใช้ยืนยันตัวตนกับ YouTube")
+# ถ้ามีไฟล์ cookies.txt (อัปโหลดเป็น Secret File บน Render) ให้ใช้ cookies
+# ช่วยยืนยันตัวตนกับ YouTube ด้วย จะช่วยแก้ error "Sign in to confirm you're
+# not a bot" ได้เสถียรกว่าวิธี player_client เฉยๆ
+#
+# หมายเหตุ: /etc/secrets/ บน Render เป็น read-only แต่ yt-dlp ต้องเขียนกลับ
+# ลงไฟล์ cookies เพื่ออัปเดตค่าหลังใช้งาน -> ต้อง copy ไฟล์ไปไว้ที่ /tmp/
+# (เขียนได้) ก่อน แล้วค่อยชี้ให้ yt-dlp ใช้ไฟล์ที่ /tmp/ แทน
+import shutil
+
+SECRET_COOKIES_PATH = os.environ.get("YTDLP_COOKIES_PATH", "/etc/secrets/cookies.txt")
+WRITABLE_COOKIES_PATH = "/tmp/cookies.txt"
+
+if os.path.isfile(SECRET_COOKIES_PATH):
+    try:
+        shutil.copyfile(SECRET_COOKIES_PATH, WRITABLE_COOKIES_PATH)
+        YDL_OPTS["cookiefile"] = WRITABLE_COOKIES_PATH
+        print(f"[YT-DLP] copy cookies จาก {SECRET_COOKIES_PATH} -> {WRITABLE_COOKIES_PATH} แล้วใช้ยืนยันตัวตนกับ YouTube")
+    except Exception as e:
+        print(f"[YT-DLP] copy cookies ไม่สำเร็จ: {e} -> รันแบบไม่มี cookies")
 else:
-    print(f"[YT-DLP] ไม่พบไฟล์ cookies ที่ {COOKIES_PATH} -> รันแบบไม่มี cookies (อาจเจอ error bot-check)")
+    print(f"[YT-DLP] ไม่พบไฟล์ cookies ที่ {SECRET_COOKIES_PATH} -> รันแบบไม่มี cookies (อาจเจอ error bot-check)")
 
 FFMPEG_BEFORE_OPTS = (
     "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
